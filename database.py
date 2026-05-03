@@ -141,7 +141,7 @@ def set_group_msg(req_id: int, msg_id: int):
 def get_requests_by_branch(branch_id: int):
     return _exec(
         """
-        SELECT id, description, status
+        SELECT id, description, status, created_at
         FROM requests
         WHERE branch_id = %s
         ORDER BY id DESC
@@ -154,7 +154,7 @@ def get_requests_by_branch(branch_id: int):
 def get_requests_by_status(status: str):
     return _exec(
         """
-        SELECT id, description, branch_id
+        SELECT id, description, branch_id, created_at
         FROM requests
         WHERE status = %s
         ORDER BY id DESC
@@ -192,10 +192,23 @@ def get_all_requests():
     )
 
 
+def get_request_author(req_id: int):
+    """Возвращает (user_id, branch_id, category_id, description) автора заявки."""
+    return _exec(
+        """
+        SELECT user_id, branch_id, category_id, description
+        FROM requests
+        WHERE id = %s
+        """,
+        (req_id,),
+        fetch="one",
+    )
+
+
 def get_requests_by_category(category_id: int):
     return _exec(
         """
-        SELECT id, description, status
+        SELECT id, description, status, created_at
         FROM requests
         WHERE category_id = %s
         ORDER BY id DESC
