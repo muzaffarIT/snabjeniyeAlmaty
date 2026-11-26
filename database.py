@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS requests (
 )
 """)
 
+# Фото выполненной работы: без него заявка не закрывается
+_exec("ALTER TABLE requests ADD COLUMN IF NOT EXISTS done_photo_file_id TEXT")
+
+# Сообщения бота «пришлите фото» → какая заявка и какая карточка в группе
+_exec("""
+CREATE TABLE IF NOT EXISTS done_prompts (
+    prompt_message_id BIGINT PRIMARY KEY,
+    req_id INTEGER NOT NULL,
+    card_message_id BIGINT NOT NULL,
+    card_has_caption BOOLEAN NOT NULL
+)
+""")
+
 
 # ================== USERS ==================
 
@@ -126,6 +139,57 @@ def update_status(req_id: int, status: str):
     _exec(
         "UPDATE requests SET status = %s WHERE id = %s",
         (status, req_id),
+    )
+
+
+def close_request(req_id: int, photo_file_id: str) -> bool:
+    """Закрывает заявку с фото результата. False — уже была закрыта (например, второе фото из альбома)."""
+    row = _exec(
+        """
+        UPDATE requests SET status = 'Решено', done_photo_file_id = %s
+        WHERE id = %s AND status <> 'Решено'
+        RETURNING id
+        """,
+        (photo_file_id, req_id),
+        fetch="one",
+    )
+    return row is not None
+
+
+def get_request(req_id: int):
+    """(branch_id, category_id, urgency, description, status) или None."""
+    return _exec(
+        """
+        SELECT branch_id, category_id, urgency, description, status
+        FROM requests
+        WHERE id = %s
+        """,
+        (req_id,),
+        fetch="one",
+    )
+
+
+def add_done_prompt(prompt_message_id: int, req_id: int, card_message_id: int, card_has_caption: bool):
+    _exec(
+        """
+        INSERT INTO done_prompts (prompt_message_id, req_id, card_message_id, card_has_caption)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (prompt_message_id) DO NOTHING
+        """,
+        (prompt_message_id, req_id, card_message_id, card_has_caption),
+    )
+
+
+def get_done_prompt(prompt_message_id: int):
+    """(req_id, card_message_id, card_has_caption) или None."""
+    return _exec(
+        """
+        SELECT req_id, card_message_id, card_has_caption
+        FROM done_prompts
+        WHERE prompt_message_id = %s
+        """,
+        (prompt_message_id,),
+        fetch="one",
     )
 
 

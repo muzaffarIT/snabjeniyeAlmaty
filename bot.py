@@ -1,19 +1,27 @@
 import asyncio
+import html
+import re
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
+    ForceReply,
     FSInputFile,
     Message,
 )
 
 from config import BOT_TOKEN, IZZAT_IDS, GROUP_ID, BRANCHES, CATEGORIES, URGENCY
 from database import (
+    add_done_prompt,
     add_request,
+    close_request,
     get_all_requests,
+    get_done_prompt,
+    get_request,
     get_request_author,
     get_requests_by_branch,
     get_requests_by_category,
@@ -57,6 +65,56 @@ def status_emoji(status: str) -> str:
         "В обработке": "🔄",
         "Решено": "🟢",
     }.get(status, "⚪️")
+
+
+def hashtag(name: str) -> str:
+    """'БЦ Республика (КРГ)' → '#БЦ_Республика_КРГ' (скобки и дефисы обрывают хэштег в Telegram)."""
+    return "#" + re.sub(r"\W+", "_", name).strip("_")
+
+
+def actor_name(user) -> str:
+    name = user.full_name or "—"
+    return f"{name} (@{user.username})" if user.username else name
+
+
+def card_text(req_id: int, branch_id: int, category_id: int, urgency: str, description: str) -> str:
+    """Карточка заявки в группе, без строк статуса."""
+    category = CATEGORIES.get(category_id, "—")
+    urgency_tag = "#Срочно" if urgency == "urgent" else "#Планово"
+    return (
+        f"🆕 <b>ЗАЯВКА №{req_id}</b>\n\n"
+        f"📍 <b>Филиал:</b> {BRANCHES.get(branch_id, '—')}\n"
+        f"📦 <b>Категория:</b> {category}\n"
+        f"⏱ <b>Срочность:</b> {URGENCY.get(urgency, '—')}\n\n"
+        f"📝 <b>Описание:</b>\n{html.escape(description)}\n\n"
+        f"{hashtag(BRANCHES.get(branch_id, ''))} #{category.split()[0]} {urgency_tag}"
+    )
+
+
+def status_lines(status: str, actor: str) -> str:
+    return (
+        f"\n\n<b>Статус:</b> {status_emoji(status)} {status}\n"
+        f"<b>Кто:</b> {html.escape(actor)}"
+    )
+
+
+def message_link(chat_id: int, message_id: int) -> str | None:
+    """Ссылка на сообщение в супергруппе (в обычной группе ссылок нет)."""
+    s = str(chat_id)
+    return f"https://t.me/c/{s[4:]}/{message_id}" if s.startswith("-100") else None
+
+
+async def edit_card(chat_id: int, message_id: int, has_caption: bool, text: str, markup) -> None:
+    try:
+        if has_caption:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text,
+                                           parse_mode="HTML", reply_markup=markup)
+        else:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id,
+                                        parse_mode="HTML", reply_markup=markup)
+    except TelegramBadRequest as e:
+        # повторное нажатие («message is not modified») или слишком длинная подпись — статус в базе уже сохранён
+        print(f"card {message_id}: не обновлена — {e}")
 
 
 def human_age(created_at: str) -> str:
@@ -138,8 +196,11 @@ async def cmd_help(message: Message):
             "<b>📦 По категории</b> — фильтр по категории.\n"
             "<b>📊 Экспорт в Excel</b> — все заявки одним файлом.\n\n"
             "<b>В группе</b> под каждой новой заявкой есть кнопка "
-            "«🔄 Взять в работу». После — «✅ Отметить как решённую».\n"
-            "Автор заявки получит уведомление о смене статуса автоматически.\n\n"
+            "«🔄 Взять в работу». После — «✅ Отметить как решённую»: бот попросит "
+            "<b>фото выполненной работы</b>, пришлите его ответом на сообщение бота — "
+            "тогда заявка закроется.\n"
+            "Автор заявки получит уведомление о смене статуса автоматически, "
+            "а при закрытии — и фото результата.\n\n"
             "Команды: /start, /menu, /id, /cancel, /help"
         )
     else:
@@ -152,7 +213,8 @@ async def cmd_help(message: Message):
             "  4. Срочность\n"
             "  5. Подтверждение\n\n"
             "<b>📄 Заявки моего филиала</b> — статус ваших заявок.\n\n"
-            "Когда заявку возьмут в работу или закроют — придёт уведомление.\n\n"
+            "Когда заявку возьмут в работу или закроют — придёт уведомление, "
+            "при закрытии — с фото выполненной работы.\n\n"
             "Команды: /start, /menu, /id, /cancel, /help"
         )
     await message.answer(text, parse_mode="HTML")
@@ -388,7 +450,7 @@ async def choose_urgency(call: CallbackQuery, state: FSMContext):
         f"📍 <b>Филиал:</b> {BRANCHES[branch_id]}\n"
         f"📦 <b>Категория:</b> {CATEGORIES[data['category_id']]}\n"
         f"⏱ <b>Срочность:</b> {URGENCY[urgency]}\n\n"
-        f"📝 <b>Описание:</b>\n{data['description']}\n\n"
+        f"📝 <b>Описание:</b>\n{html.escape(data['description'])}\n\n"
         "Всё верно? Нажмите «✅ Отправить».\n"
         "Если что-то не так — «❌ Отменить» и создайте заново."
     )
@@ -435,18 +497,7 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
         None,
     ))
 
-    branch_tag = f"#{BRANCHES[branch_id].replace(' ', '_')}"
-    category_tag = f"#{CATEGORIES[data['category_id']].split()[0]}"
-    urgency_tag = "#Срочно" if data["urgency"] == "urgent" else "#Планово"
-
-    text = (
-        f"🆕 <b>ЗАЯВКА №{req_id}</b>\n\n"
-        f"📍 <b>Филиал:</b> {BRANCHES[branch_id]}\n"
-        f"📦 <b>Категория:</b> {CATEGORIES[data['category_id']]}\n"
-        f"⏱ <b>Срочность:</b> {URGENCY[data['urgency']]}\n\n"
-        f"📝 <b>Описание:</b>\n{data['description']}\n\n"
-        f"{branch_tag} {category_tag} {urgency_tag}"
-    )
+    text = card_text(req_id, branch_id, data["category_id"], data["urgency"], data["description"])
 
     media = data.get("media")
     try:
@@ -709,61 +760,135 @@ async def change_status(call: CallbackQuery):
 
     action, req_id = call.data.split("_")
     req_id = int(req_id)
-    status = "В обработке" if action == "work" else "Решено"
+    req = get_request(req_id)
+    if req is None:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    branch_id, category_id, urgency, description, current = req
+    if current == "Решено":
+        await call.answer("Заявка уже решена")
+        return
 
+    if action == "done":
+        await ask_done_photo(call, req_id)
+        return
+
+    status = "В обработке"
     update_status(req_id, status)
-
-    import re
-    base_text = call.message.text or call.message.caption or ""
-    base_text = re.sub(r"\n\n<b>Статус:</b>.*", "", base_text, flags=re.DOTALL)
-    base_text = re.sub(r"\n\nСтатус:.*", "", base_text, flags=re.DOTALL)
-
-    actor = call.from_user.full_name or call.from_user.username or "—"
-    new_text = (
-        f"{base_text}\n\n"
-        f"<b>Статус:</b> {status_emoji(status)} {status}\n"
-        f"<b>Кто:</b> {actor}"
+    actor = actor_name(call.from_user)
+    await edit_card(
+        call.message.chat.id,
+        call.message.message_id,
+        call.message.caption is not None,
+        card_text(req_id, branch_id, category_id, urgency, description) + status_lines(status, actor),
+        status_kb(req_id, status),
     )
-
-    if call.message.caption is not None:
-        await call.message.edit_caption(
-            caption=new_text,
-            reply_markup=status_kb(req_id, status),
-            parse_mode="HTML",
-        )
-    else:
-        await call.message.edit_text(
-            new_text,
-            reply_markup=status_kb(req_id, status),
-            parse_mode="HTML",
-        )
 
     # Уведомление автору
     author = get_request_author(req_id)
-    if author:
-        author_id = author[0]
-        if author_id != call.from_user.id:
-            try:
-                if status == "В обработке":
-                    await bot.send_message(
-                        author_id,
-                        f"🔄 <b>Ваша заявка №{req_id} взята в работу</b>\n"
-                        f"Ответственный: {actor}\n"
-                        "Сообщим, как только будет решение.",
-                        parse_mode="HTML",
-                    )
-                else:
-                    await bot.send_message(
-                        author_id,
-                        f"✅ <b>Ваша заявка №{req_id} решена!</b>\n"
-                        f"Закрыл: {actor}\n"
-                        "Спасибо за обращение 🙌",
-                        parse_mode="HTML",
-                    )
-            except Exception:
-                pass  # пользователь мог не запускать бота в личке
+    if author and author[0] != call.from_user.id:
+        try:
+            await bot.send_message(
+                author[0],
+                f"🔄 <b>Ваша заявка №{req_id} взята в работу</b>\n"
+                f"Ответственный: {html.escape(actor)}\n"
+                "Сообщим, как только будет решение.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass  # пользователь мог не запускать бота в личке
 
     await call.answer(f"Статус: {status}")
+
+
+# ================== ЗАКРЫТИЕ ЗАЯВКИ ТОЛЬКО С ФОТО РЕЗУЛЬТАТА ==================
+
+async def ask_done_photo(call: CallbackQuery, req_id: int):
+    """«Отметить как решённую» не закрывает сразу: бот просит фото выполненной работы ответом на своё сообщение."""
+    user = call.from_user
+    mention = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or "ответственный")}</a>'
+    prompt = await call.message.reply(
+        f"📸 {mention}, пришлите <b>фото выполненной работы</b> по заявке №{req_id} "
+        "ответом на это сообщение.\n"
+        "Заявка закроется как решённая, когда придёт фото.",
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True, input_field_placeholder=f"Фото по заявке №{req_id}"),
+    )
+    add_done_prompt(prompt.message_id, req_id, call.message.message_id, call.message.caption is not None)
+    await call.answer("Пришлите фото выполненной работы ответом на сообщение бота 📸")
+
+
+async def reply_to_done_prompt(message: Message):
+    """Фильтр: ответ на сообщение бота «пришлите фото» → данные заявки для обработчика."""
+    r = message.reply_to_message
+    if r is None or r.from_user is None or r.from_user.id != bot.id:
+        return False
+    prompt = get_done_prompt(r.message_id)
+    if prompt is None:
+        return False
+    req_id, card_id, card_has_caption = prompt
+    return {"req_id": req_id, "card_id": card_id, "card_has_caption": card_has_caption}
+
+
+@dp.message(reply_to_done_prompt)
+async def done_photo(message: Message, req_id: int, card_id: int, card_has_caption: bool):
+    if not is_admin(message.from_user.id):
+        await message.reply("Фото выполненной работы присылает ответственный за снабжение.")
+        return
+    if not message.photo:
+        await message.reply(
+            "❗ Нужно именно <b>фото</b> выполненной работы.\n"
+            "Пришлите его ответом на сообщение бота — тогда заявка закроется.",
+            parse_mode="HTML",
+        )
+        return
+
+    photo_id = message.photo[-1].file_id
+    req = get_request(req_id)
+    if req is None:
+        return
+    if not close_request(req_id, photo_id):
+        if message.media_group_id is None:  # остальные фото альбома — молча
+            await message.reply(f"Заявка №{req_id} уже закрыта.")
+        return
+    branch_id, category_id, urgency, description, _ = req
+    actor = actor_name(message.from_user)
+
+    link = message_link(message.chat.id, message.message_id)
+    photo_line = (f'\n📸 <a href="{link}">Фото выполненной работы</a>' if link
+                  else "\n📸 Фото выполненной работы — в ответах к заявке")
+    await edit_card(
+        message.chat.id,
+        card_id,
+        card_has_caption,
+        card_text(req_id, branch_id, category_id, urgency, description) + status_lines("Решено", actor) + photo_line,
+        None,
+    )
+    try:
+        await bot.edit_message_text(
+            f"✅ Заявка №{req_id} решена — фото выполненной работы ниже ⬇️",
+            chat_id=message.chat.id,
+            message_id=message.reply_to_message.message_id,
+        )
+    except TelegramBadRequest:
+        pass
+    await message.reply(f"✅ Заявка №{req_id} закрыта как решённая. Спасибо!")
+
+    # Уведомление автору — с фото результата
+    author = get_request_author(req_id)
+    if author and author[0] != message.from_user.id:
+        try:
+            await bot.send_photo(
+                author[0],
+                photo_id,
+                caption=f"✅ <b>Ваша заявка №{req_id} решена!</b>\n"
+                        f"Закрыл: {html.escape(actor)}\n"
+                        "На фото — выполненная работа.\n"
+                        "Спасибо за обращение 🙌",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass  # пользователь мог не запускать бота в личке
 
 
 # ================== FALLBACK ==================
